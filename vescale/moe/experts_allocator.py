@@ -62,21 +62,36 @@ class ExpertsAllocator(ABC):
 
 class BasicExpertsAllocator(ExpertsAllocator):
     def __init__(self, exp_config=None, env_config=None):
-        self.experts_num = 8
+        self.experts_num = 4
         self.visit_flag = set()
+        self.visited_layers = 0
+        self.flip = 0
 
-        self.experts_allocation = []  # A list of DP * TP
+        self.experts_allocation = [[], []]  # A list of DP * TP
         world_size = dist.get_world_size()
         devices = torch.arange(world_size)
-        for _ in range(self.experts_num):
-            self.experts_allocation.append(DeviceMesh("cuda", devices.reshape(1, -1), mesh_dim_names=("DP", "TP")))
+        # for _ in range(self.experts_num):
+        #     self.experts_allocation.append(DeviceMesh("cuda", devices.reshape(1, -1), mesh_dim_names=("DP", "TP")))
+        for _ in range(2):
+            self.experts_allocation[0].append(DeviceMesh("cuda", [[0, 1]], mesh_dim_names=("DP", "TP")))
+            self.experts_allocation[1].append(DeviceMesh("cuda", [[2], [3]], mesh_dim_names=("DP", "TP")))
+        for _ in range(2):
+            self.experts_allocation[0].append(DeviceMesh("cuda", [[2], [3]], mesh_dim_names=("DP", "TP")))
+            self.experts_allocation[1].append(DeviceMesh("cuda", [0, 1], mesh_dim_names=("DP", "TP")))
+
 
     def collect_performance(self, perf, iter=-1):
         pass
 
     def allocate_experts(self, layer_id, iter=-1) -> Union[None, List[DeviceMesh]]:
-        if layer_id not in self.visit_flag:
-            self.visit_flag.add(layer_id)
-            return self.experts_allocation
-        else:
-            return None
+        # if layer_id not in self.visit_flag:
+        #     self.visit_flag.add(layer_id)
+        #     return self.experts_allocation
+        # else:
+        #     return None
+        self.visited_layers += 1
+        ret = self.experts_allocation[self.flip]
+        if self.visited_layers == 2:
+            self.visited_layers = 0
+            self.flip = 1 - self.flip
+        return ret
