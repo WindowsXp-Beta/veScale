@@ -11,6 +11,7 @@
 from typing import Dict, List, Tuple, cast
 
 import torch
+import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 
 import vescale.dtensor.dtensor as dtensor
@@ -570,8 +571,249 @@ class CrossMeshRedistribute(torch.autograd.Function):
         async_op: bool = True,
     ):
         previous_spec = input._spec
+        previous_mesh = previous_spec.mesh
         ctx.previous_spec = previous_spec
         ctx.async_op = async_op
+
+        # Convert rank into id_in_grp
+        local_tensor = torch.tensor([], device=input.device, dtype=input.dtype)
+
+        previous_dp_dim, previous_tp_dim = previous_mesh.shape
+        cur_dp_dim, cur_tp_dim = device_mesh.shape
+
+        assert max(previous_dp_dim, cur_dp_dim) % min(previous_dp_dim, cur_dp_dim) == 0
+        assert max(previous_tp_dim, cur_tp_dim) % min(previous_tp_dim, cur_tp_dim) == 0
+        k = max(previous_dp_dim, cur_dp_dim) // min(previous_dp_dim, cur_dp_dim)
+        l = max(previous_tp_dim, cur_tp_dim) // min(previous_tp_dim, cur_tp_dim)
+
+        # Case 0: [k, l] -> [1, 1]
+        # Case 1: [1, 1] -> [k, l]
+        # Case 2: [k, 1] -> [1, l]
+        # Case 3: [1, l] -> [k, 1]
+        grp_rows, grp_cols = [0] * 2, [0] * 2  # [0] is the sender and [1] is the receiver
+        if previous_dp_dim >= cur_dp_dim:
+            if previous_tp_dim >= cur_tp_dim:
+                case = 0
+                grp_rows[0], grp_cols[0] = k, l
+                grp_rows[1], grp_cols[1] = 1, 1
+            else:
+                case = 2
+                grp_rows[0], grp_cols[0] = k, 1
+                grp_rows[1], grp_cols[1] = 1, l
+        else:
+            if previous_tp_dim >= cur_tp_dim:
+                case = 3
+                grp_rows[0], grp_cols[0] = 1, l
+                grp_rows[1], grp_cols[1] = k, 1
+            else:
+                case = 1
+                grp_rows[0], grp_cols[0] = 1, 1
+                grp_rows[1], grp_cols[1] = k, l
+        # dist.breakpoint(0)
+
+        def convert_coord_to_rank(
+            grp_row_id: int,
+            grp_col_id: int,
+            row_in_grp: int,
+            col_in_grp: int,
+            grp_rows: int,
+            grp_cols: int,
+            rows: int,
+            cols: int,
+            rank_base: int,
+        ):
+            row, col = grp_row_id * grp_rows + row_in_grp, grp_col_id * grp_cols + col_in_grp
+            return rank_base + row * cols + col
+
+        reqs = []
+        if (ret := previous_mesh.get_coordinate()) is not None:
+            recv_coords = []
+            send_tensor = input.to_local()
+            tensor_shape_row, tensor_shape_col = send_tensor.shape
+            row, col = ret
+            row_in_grp, col_in_grp = row % grp_rows[0], col % grp_cols[0]
+            grp_row_id, grp_col_id = row // grp_rows[0], col // grp_cols[0]
+
+            if case == 0:
+                rounds = 1
+                grid_rows, grid_cols = tensor_shape_row, tensor_shape_col
+                recv_coords.append((0, 0))
+            elif case == 1:
+                rounds = k * l
+                grid_rows, grid_cols = tensor_shape_row // k, tensor_shape_col // l
+                for rnd in range(rounds):
+                    recv_coords.append((rnd // l, rnd % l))
+            elif case == 2:
+                grid_rows, grid_cols = tensor_shape_row, tensor_shape_col // l
+                rounds = l
+                if k >= l:
+                    for rnd in range(rounds):
+                        if row_in_grp <= l - 1:
+                            recv_col_in_grp = (row_in_grp - rnd + l) % l
+                        else:
+                            recv_col_in_grp = l - 1 - rnd
+                        recv_coords.append((0, recv_col_in_grp))
+                else:
+                    for rnd in range(rounds):
+                        recv_col_in_grp = (row_in_grp + rnd) % l
+                        recv_coords.append((0, recv_col_in_grp))
+            elif case == 3:
+                grid_rows, grid_cols = tensor_shape_row // k, tensor_shape_col
+                rounds = k
+                if k >= l:
+                    for rnd in range(rounds):
+                        recv_row_in_grp = (col_in_grp + rnd) % k
+                        recv_coords.append((recv_row_in_grp, 0))
+                else:
+                    for rnd in range(rounds):
+                        if col_in_grp <= k - 1:
+                            recv_row_in_grp = (col_in_grp - rnd + l) % l
+                        else:
+                            recv_row_in_grp = k - 1 - rnd
+                        recv_coords.append((recv_row_in_grp, 0))
+
+            ranks = [
+                convert_coord_to_rank(
+                    grp_row_id,
+                    grp_col_id,
+                    recv_row_in_grp,
+                    recv_col_in_grp,
+                    grp_rows[1],
+                    grp_cols[1],
+                    cur_dp_dim,
+                    cur_tp_dim,
+                    device_mesh.mesh.view(-1)[0].item(),
+                )
+                for recv_row_in_grp, recv_col_in_grp in recv_coords
+            ]
+            print(f"Rk {dist.get_rank()}: {recv_coords} {ranks}")
+            reqs.extend(
+                [
+                    dist.P2POp(
+                        dist.isend,
+                        send_tensor[
+                            recv_row_in_grp * grid_rows : (recv_row_in_grp + 1) * grid_rows,
+                            recv_col_in_grp * grid_cols : (recv_col_in_grp + 1) * grid_cols,
+                        ],
+                        convert_coord_to_rank(
+                            grp_row_id,
+                            grp_col_id,
+                            recv_row_in_grp,
+                            recv_col_in_grp,
+                            grp_rows[1],
+                            grp_cols[1],
+                            cur_dp_dim,
+                            cur_tp_dim,
+                            device_mesh.mesh.view(-1)[0],
+                        ),
+                    )
+                    for recv_row_in_grp, recv_col_in_grp in recv_coords
+                ]
+            )
+
+        if (ret := device_mesh.get_coordinate()) is not None:
+            send_coords = []
+            tensor_shape_row, tensor_shape_col = (
+                input.shape[0] // cur_dp_dim,
+                input.shape[1] // cur_tp_dim,
+            )
+            local_tensor = torch.empty(
+                (tensor_shape_row, tensor_shape_col),
+                device=input.device,
+                dtype=input.dtype,
+                requires_grad=input.requires_grad,
+            )
+            row, col = ret
+            row_in_grp, col_in_grp = row % grp_rows[1], col % grp_cols[1]
+            grp_row_id, grp_col_id = row // grp_rows[1], col // grp_cols[1]
+
+            if case == 0:
+                rounds = k * l
+                grid_rows, grid_cols = tensor_shape_row // k, tensor_shape_col // l
+                for rnd in range(rounds):
+                    send_coords.append((rnd // l, rnd % l))
+            elif case == 1:
+                rounds = 1
+                grid_rows, grid_cols = tensor_shape_row, tensor_shape_col
+                send_coords.append((0, 0))
+            elif case == 2:
+                grid_rows, grid_cols = tensor_shape_row // k, tensor_shape_col
+                rounds = k
+                if k >= l:
+                    for rnd in range(rounds):
+                        send_row_in_grp = (col_in_grp + rnd) % k
+                        send_coords.append((send_row_in_grp, 0))
+                else:
+                    for rnd in range(rounds):
+                        if col_in_grp <= k - 1:
+                            send_row_in_grp = (col_in_grp - rnd + k) % k
+                        else:
+                            send_row_in_grp = k - 1 - rnd
+                        send_coords.append((send_row_in_grp, 0))
+            elif case == 3:
+                grid_rows, grid_cols = tensor_shape_row, tensor_shape_col // l
+                rounds = l
+                if k >= l:
+                    for rnd in range(rounds):
+                        if row_in_grp <= l - 1:
+                            send_col_in_grp = (row_in_grp - rnd + l) % l
+                        else:
+                            send_col_in_grp = l - 1 - rnd
+                        send_coords.append((0, send_col_in_grp))
+                else:
+                    for rnd in range(rounds):
+                        send_col_in_grp = (row_in_grp + rnd) % l
+                        send_coords.append((0, send_col_in_grp))
+
+            ranks = [
+                convert_coord_to_rank(
+                    grp_row_id,
+                    grp_col_id,
+                    send_row_in_grp,
+                    send_col_in_grp,
+                    grp_rows[0],
+                    grp_rows[0],
+                    previous_dp_dim,
+                    previous_tp_dim,
+                    previous_mesh.mesh.view(-1)[0].item(),
+                )
+                for send_row_in_grp, send_col_in_grp in send_coords
+            ]
+            print(f"Rk {dist.get_rank()}: {send_coords} {ranks}")
+
+            reqs.extend(
+                [
+                    dist.P2POp(
+                        dist.irecv,
+                        local_tensor[
+                            send_row_in_grp * grid_rows : (send_row_in_grp + 1) * grid_rows,
+                            send_col_in_grp * grid_cols : (send_col_in_grp + 1) * grid_cols,
+                        ],
+                        convert_coord_to_rank(
+                            grp_row_id,
+                            grp_col_id,
+                            send_row_in_grp,
+                            send_col_in_grp,
+                            grp_rows[0],
+                            grp_rows[0],
+                            previous_dp_dim,
+                            previous_tp_dim,
+                            previous_mesh.mesh.view(-1)[0],
+                        ),
+                    )
+                    for send_row_in_grp, send_col_in_grp in send_coords
+                ]
+            )
+
+        if len(reqs) > 0:
+            reqs = dist.batch_isend_irecv(reqs)
+            for req in reqs:
+                req.wait()
+
+        if device_mesh.get_coordinate() is not None:
+            return dtensor.DTensor.from_local(local_tensor, device_mesh, placements)
+        else:
+            return torch.tensor([])
 
         # step 1: redistribute to [Replicate()] * mesh_dimension
         placements1 = [Replicate()] * previous_spec.mesh.ndim
@@ -579,6 +821,10 @@ class CrossMeshRedistribute(torch.autograd.Function):
 
         # step 2: broastcast across mesh
         # select the sender through min-reduce
+        """
+        DeviceMesh((2, 4), dim=["dp", "tp"])
+        print(previous_spec.mesh)
+        """
         sender = previous_spec.mesh.mesh.min().to(input.device)
         world_size = torch.distributed.get_world_size()
         world_mesh = DeviceMesh(device_mesh.device_type, list(range(world_size)))
