@@ -258,7 +258,7 @@ class MoELayerParamBuffer:
                             shape=global_shape,
                             stride=stride,
                         )
-                        current_refresh_buffer[key] = dtensor.redistribute(
+                        current_refresh_buffer[key] = dtensor.cross_mesh_redistribute(
                             alloc, placements, async_op=False
                         )._local_tensor
 

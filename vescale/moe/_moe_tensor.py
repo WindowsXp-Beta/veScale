@@ -69,7 +69,7 @@ def moe_tensor_forward(expert: nn.Module, task: MoETask, scheduler: MoEScheduler
 def register_tensor_operations_with_placeholder(config):
     original_index_add_ = torch.Tensor.index_add_
 
-    def wrappped_index_add_(self, dim: int, index: torch.Tensor, value: Union[torch.Tensor, MoETensorPlaceholder]):
+    def wrapped_index_add_(self, dim: int, index: torch.Tensor, value: Union[torch.Tensor, MoETensorPlaceholder]):
         if isinstance(value, MoETensorPlaceholder):
             assert value.state == _MOE_STATE_WEIGHTED_EXPERT_OUTPUT
             if not hasattr(self, "_moe_tensor_placeholder"):
@@ -92,4 +92,4 @@ def register_tensor_operations_with_placeholder(config):
             with torch._C.DisableTorchFunctionSubclass():
                 return original_index_add_(self, dim, index, value)
 
-    torch.Tensor.index_add_ = wrappped_index_add_
+    torch.Tensor.index_add_ = wrapped_index_add_
